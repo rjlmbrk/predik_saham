@@ -38,21 +38,32 @@ def download_stock_data(ticker, start_date, end_date):
 
 def recompute_indicators(data):
     df = data.copy()
+    
+    # Moving Averages
     df['SMA_10'] = df['Close'].rolling(window=10).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
 
+    # RSI (14)
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / (loss + 1e-10)
     df['RSI_14'] = 100 - (100 / (1 + rs))
 
+    # MACD
     exp1 = df['Close'].ewm(span=12, adjust=False).mean()
     exp2 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp1 - exp2
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
 
+    # Stochastic Oscillator (14, 3)
+    low_14 = df['Low'].rolling(window=14).min()
+    high_14 = df['High'].rolling(window=14).max()
+    df['Stoch_K'] = 100 * ((df['Close'] - low_14) / (high_14 - low_14 + 1e-10))
+    df['Stoch_D'] = df['Stoch_K'].rolling(window=3).mean()
+
+    # Lags & Volatility
     df['Close_Lag1'] = df['Close'].shift(1)
     df['Close_Lag2'] = df['Close'].shift(2)
     df['Close_Lag3'] = df['Close'].shift(3)
@@ -66,7 +77,6 @@ def recompute_indicators(data):
 def prepare_data(df):
     data = recompute_indicators(df)
     data['Target'] = data['Close'].shift(-1)
-    # Gantikan nilain inf / -inf menjadi NaN lalu bersihkan seluruh NaN
     data = data.replace([np.inf, -np.inf], np.nan)
     data.dropna(inplace=True)
     return data
@@ -75,8 +85,9 @@ def train_model(df):
     feature_cols = [
         'Open', 'High', 'Low', 'Close', 'Volume',
         'SMA_10', 'SMA_50', 'EMA_20', 'RSI_14',
-        'MACD', 'MACD_Signal', 'Close_Lag1', 'Close_Lag2',
-        'Close_Lag3', 'Close_Lag5', 'Daily_Return', 'Volatility_10'
+        'MACD', 'MACD_Signal', 'Stoch_K', 'Stoch_D',
+        'Close_Lag1', 'Close_Lag2', 'Close_Lag3', 'Close_Lag5',
+        'Daily_Return', 'Volatility_10'
     ]
 
     X = df[feature_cols]
@@ -94,7 +105,6 @@ def train_model(df):
     model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=False)
     y_pred = model.predict(X_test)
 
-    # Konversi ke array 1D float dan pastikan tidak ada nilai invalid
     y_test_arr = np.asarray(y_test, dtype=np.float64).ravel()
     y_pred_arr = np.asarray(y_pred, dtype=np.float64).ravel()
     
@@ -107,6 +117,17 @@ def train_model(df):
     mape = mean_absolute_percentage_error(y_test_clean, y_pred_clean) * 100
 
     return model, X_test, y_test, y_pred, feature_cols, rmse, mae, mape
+
+def get_mape_category(mape_value):
+    """Menentukan kategori akurasi berdasarkan nilai MAPE."""
+    if mape_value < 10:
+        return "Sangat Akurat", "🟢"
+    elif mape_value <= 20:
+        return "Bagus / Akurat", "🟡"
+    elif mape_value <= 50:
+        return "Cukup Akurat", "🟠"
+    else:
+        return "Kurang Akurat", "🔴"
 
 def forecast_future(model, df_raw, feature_cols, days=5):
     sim_df = df_raw.copy()
@@ -166,11 +187,22 @@ if st.sidebar.button("🚀 Jalankan Prediksi", type="primary"):
                     signal_text = "HOLD / NEUTRAL"
                     take_profit, stop_loss = target_1w, last_close * 0.985
 
+                mape_cat, mape_icon = get_mape_category(mape)
+
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Harga Terakhir", f"Rp {last_close:,.2f}")
                 c2.metric("Target 1 Minggu", f"Rp {target_1w:,.2f}", f"{pct_change_1w:+.2f}%")
                 c3.metric("Sinyal Posisi", signal_text)
-                c4.metric("Akurasi (MAPE)", f"{mape:.2f}%")
+                c4.metric("Error Model (MAPE)", f"{mape:.2f}%", f"{mape_icon} {mape_cat}", delta_color="normal")
+
+                # Keterangan Acuan MAPE
+                with st.expander("ℹ️ Info Acuan Kategori MAPE"):
+                    st.markdown("""
+                    - **< 10%**: **Sangat Akurat** (Kemampuan prediksi sangat tinggi)
+                    - **10% - 20%**: **Bagus / Akurat** (Prediksi layak digunakan)
+                    - **20% - 50%**: **Cukup Akurat** (Ekspektasi moderat)
+                    - **> 50%**: **Kurang Akurat** (Model kurang direkomendasikan)
+                    """)
 
                 # Grafik Plotly
                 fig = go.Figure()
@@ -189,6 +221,7 @@ if st.sidebar.button("🚀 Jalankan Prediksi", type="primary"):
                         f"🎯 *Target Price (1W):* Rp {take_profit:,.2f}\n"
                         f"🛡️ *Stop Loss:* Rp {stop_loss:,.2f}\n"
                         f"📊 *Proyeksi Return:* +{pct_change_1w:.2f}%\n"
+                        f"📊 *MAPE Model:* {mape:.2f}% ({mape_cat})\n"
                         f"📅 *Tanggal:* {last_date.strftime('%Y-%m-%d')}"
                     )
                     if send_telegram_message(BOT_TOKEN, CHAT_ID, pesan):
