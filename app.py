@@ -12,7 +12,6 @@ import requests
 # ==========================================
 st.set_page_config(page_title="IDX Stock Prediction Web", page_icon="📈", layout="wide")
 
-# Mengambil Token Telegram dari Secrets Hosting secara aman
 BOT_TOKEN = st.secrets.get("BOT_TOKEN", "8888470562:AAHowR8rtYH15by5H8hzwepz7P5aJ6Qm2yA")
 CHAT_ID = st.secrets.get("CHAT_ID", "954645250")
 
@@ -31,7 +30,10 @@ def send_telegram_message(bot_token, chat_id, message):
 def download_stock_data(ticker, start_date, end_date):
     df = yf.download(ticker, start=start_date, end=end_date)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        try:
+            df = df.xs(ticker, axis=1, level=1)
+        except Exception:
+            df.columns = df.columns.get_level_values(0)
     return df
 
 def recompute_indicators(data):
@@ -64,6 +66,8 @@ def recompute_indicators(data):
 def prepare_data(df):
     data = recompute_indicators(df)
     data['Target'] = data['Close'].shift(-1)
+    # Gantikan nilain inf / -inf menjadi NaN lalu bersihkan seluruh NaN
+    data = data.replace([np.inf, -np.inf], np.nan)
     data.dropna(inplace=True)
     return data
 
@@ -90,9 +94,17 @@ def train_model(df):
     model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_test, y_test)], verbose=False)
     y_pred = model.predict(X_test)
 
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    mae = mean_absolute_error(y_test, y_pred)
-    mape = mean_absolute_percentage_error(y_test, y_pred) * 100
+    # Konversi ke array 1D float dan pastikan tidak ada nilai invalid
+    y_test_arr = np.asarray(y_test, dtype=np.float64).ravel()
+    y_pred_arr = np.asarray(y_pred, dtype=np.float64).ravel()
+    
+    valid_mask = ~np.isnan(y_test_arr) & ~np.isnan(y_pred_arr) & ~np.isinf(y_test_arr) & ~np.isinf(y_pred_arr)
+    y_test_clean = y_test_arr[valid_mask]
+    y_pred_clean = y_pred_arr[valid_mask]
+
+    rmse = np.sqrt(mean_squared_error(y_test_clean, y_pred_clean))
+    mae = mean_absolute_error(y_test_clean, y_pred_clean)
+    mape = mean_absolute_percentage_error(y_test_clean, y_pred_clean) * 100
 
     return model, X_test, y_test, y_pred, feature_cols, rmse, mae, mape
 
@@ -105,13 +117,14 @@ def forecast_future(model, df_raw, feature_cols, days=5):
     for next_date in future_dates:
         sim_df_updated = recompute_indicators(sim_df)
         last_features = sim_df_updated[feature_cols].iloc[[-1]]
-        pred_price = model.predict(last_features)[0]
+        pred_price = float(model.predict(last_features)[0])
 
         future_records.append({'Tanggal': next_date.strftime('%Y-%m-%d'), 'Prediksi_Harga': pred_price})
 
+        last_vol = float(sim_df['Volume'].iloc[-1])
         new_row = pd.DataFrame({
-            'Open': pred_price, 'High': pred_price * 1.003, 'Low': pred_price * 0.997,
-            'Close': pred_price, 'Volume': sim_df['Volume'].iloc[-1]
+            'Open': [pred_price], 'High': [pred_price * 1.003], 'Low': [pred_price * 0.997],
+            'Close': [pred_price], 'Volume': [last_vol]
         }, index=[next_date])
 
         sim_df = pd.concat([sim_df, new_row])
@@ -131,48 +144,54 @@ if st.sidebar.button("🚀 Jalankan Prediksi", type="primary"):
 
         if not df_raw.empty:
             df_processed = prepare_data(df_raw)
-            model, X_test, y_test, y_pred, feature_cols, rmse, mae, mape = train_model(df_processed)
-            pred_df = forecast_future(model, df_raw, feature_cols, days=5)
-
-            last_close = df_raw['Close'].iloc[-1]
-            last_date = df_raw.index[-1]
-            target_1w = pred_df['Prediksi_Harga'].iloc[-1]
-            pct_change_1w = ((target_1w - last_close) / last_close) * 100
-
-            if pct_change_1w >= 1.5:
-                signal_text = "BUY / ENTRY LONG"
-                take_profit, stop_loss = target_1w, last_close * 0.98
-            elif pct_change_1w <= -1.5:
-                signal_text = "SELL / WAIT & SEE"
-                take_profit, stop_loss = None, None
+            
+            if len(df_processed) < 50:
+                st.error("Data terlalu sedikit setelah dibersihkan. Harap perluas rentang tanggal mulai/akhir.")
             else:
-                signal_text = "HOLD / NEUTRAL"
-                take_profit, stop_loss = target_1w, last_close * 0.985
+                model, X_test, y_test, y_pred, feature_cols, rmse, mae, mape = train_model(df_processed)
+                pred_df = forecast_future(model, df_raw, feature_cols, days=5)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Harga Terakhir", f"Rp {last_close:,.2f}")
-            c2.metric("Target 1 Minggu", f"Rp {target_1w:,.2f}", f"{pct_change_1w:+.2f}%")
-            c3.metric("Sinyal Posisi", signal_text)
-            c4.metric("Akurasi (MAPE)", f"{mape:.2f}%")
+                last_close = float(df_raw['Close'].iloc[-1])
+                last_date = df_raw.index[-1]
+                target_1w = float(pred_df['Prediksi_Harga'].iloc[-1])
+                pct_change_1w = ((target_1w - last_close) / last_close) * 100
 
-            # Grafik Plotly
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=y_test.index, y=y_test.values, name='Harga Aktual (Test)', line=dict(color='#29b6f6')))
-            fig.add_trace(go.Scatter(x=y_test.index, y=y_pred, name='Prediksi Model', line=dict(color='#ffa726', dash='dash')))
-            fig.add_trace(go.Scatter(x=pd.to_datetime(pred_df['Tanggal']), y=pred_df['Prediksi_Harga'], name='Proyeksi 1 Minggu', line=dict(color='#ff1744', width=3), marker=dict(size=8)))
-            fig.update_layout(template="plotly_dark", height=500, title=f"Proyeksi Harga {TICKER}")
-            st.plotly_chart(fig, use_container_width=True)
+                if pct_change_1w >= 1.5:
+                    signal_text = "BUY / ENTRY LONG"
+                    take_profit, stop_loss = target_1w, last_close * 0.98
+                elif pct_change_1w <= -1.5:
+                    signal_text = "SELL / WAIT & SEE"
+                    take_profit, stop_loss = None, None
+                else:
+                    signal_text = "HOLD / NEUTRAL"
+                    take_profit, stop_loss = target_1w, last_close * 0.985
 
-            # Telegram Alert
-            if "BUY" in signal_text and BOT_TOKEN and CHAT_ID:
-                pesan = (
-                    f"🚨 *SINYAL BUY DETECTED!* 🚨\n\n"
-                    f"📈 *Emiten:* `{TICKER}`\n"
-                    f"💵 *Harga Terakhir:* Rp {last_close:,.2f}\n"
-                    f"🎯 *Target Price (1W):* Rp {take_profit:,.2f}\n"
-                    f"🛡️ *Stop Loss:* Rp {stop_loss:,.2f}\n"
-                    f"📊 *Proyeksi Return:* +{pct_change_1w:.2f}%\n"
-                    f"📅 *Tanggal:* {last_date.strftime('%Y-%m-%d')}"
-                )
-                if send_telegram_message(BOT_TOKEN, CHAT_ID, pesan):
-                    st.success("Notifikasi Sinyal BUY berhasil dikirim ke Telegram!")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Harga Terakhir", f"Rp {last_close:,.2f}")
+                c2.metric("Target 1 Minggu", f"Rp {target_1w:,.2f}", f"{pct_change_1w:+.2f}%")
+                c3.metric("Sinyal Posisi", signal_text)
+                c4.metric("Akurasi (MAPE)", f"{mape:.2f}%")
+
+                # Grafik Plotly
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=y_test.index, y=y_test.values, name='Harga Aktual (Test)', line=dict(color='#29b6f6')))
+                fig.add_trace(go.Scatter(x=y_test.index, y=y_pred, name='Prediksi Model', line=dict(color='#ffa726', dash='dash')))
+                fig.add_trace(go.Scatter(x=pd.to_datetime(pred_df['Tanggal']), y=pred_df['Prediksi_Harga'], name='Proyeksi 1 Minggu', line=dict(color='#ff1744', width=3), marker=dict(size=8)))
+                fig.update_layout(template="plotly_dark", height=500, title=f"Proyeksi Harga {TICKER}")
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Telegram Alert
+                if "BUY" in signal_text and BOT_TOKEN and CHAT_ID:
+                    pesan = (
+                        f"🚨 *SINYAL BUY DETECTED!* 🚨\n\n"
+                        f"📈 *Emiten:* `{TICKER}`\n"
+                        f"💵 *Harga Terakhir:* Rp {last_close:,.2f}\n"
+                        f"🎯 *Target Price (1W):* Rp {take_profit:,.2f}\n"
+                        f"🛡️ *Stop Loss:* Rp {stop_loss:,.2f}\n"
+                        f"📊 *Proyeksi Return:* +{pct_change_1w:.2f}%\n"
+                        f"📅 *Tanggal:* {last_date.strftime('%Y-%m-%d')}"
+                    )
+                    if send_telegram_message(BOT_TOKEN, CHAT_ID, pesan):
+                        st.success("Notifikasi Sinyal BUY berhasil dikirim ke Telegram!")
+        else:
+            st.error("Gagal mengunduh data saham. Periksa kode ticker atau koneksi internet.")
